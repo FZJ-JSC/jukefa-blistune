@@ -41,10 +41,10 @@ except ImportError:  # pragma: no cover
 
 OPERATIONS = ("gemm", "hemm", "herk", "trmm", "trsm")
 
-# precision -> (driver -d char, BLIS env var suffix)
+# precision -> (driver -d char, BLIS env var suffix, element size in bytes)
 PRECISIONS = {
-    "fp32": ("s", "S"),
-    "fp64": ("d", "D"),
+    "fp32": ("s", "S", 4),
+    "fp64": ("d", "D", 8),
 }
 
 # Thread loops, in the order used by the "jc_ic_jr_ir" categorical encoding.
@@ -55,6 +55,21 @@ BLOCK_PARAMS = {
     "kc": ("KC", 256, 3072, 32),
     "mr-in-mc": ("MR_IN_MC", 16, 128, 4),
     "nr-in-nc": ("NR_IN_NC", 128, 2048, 32),
+}
+
+# --tile search space: the A and B panel sizes in bytes -> (min, max, step).
+# A panel = MC*KC*esize, B panel = NC*KC*esize. Those products are the cache
+# capacity invariants, so their optimum does not move with the microkernel the
+# way a multiple of MR/NR does.
+TILE_PARAMS = {
+    "a-tile": (64 << 10, 1 << 20, 32 << 10),
+    "b-tile": (256 << 10, 8 << 20, 256 << 10),
+}
+
+# --tile stem -> (block size stem whose env var it derives, MR or NR as the unit)
+TILE_TARGETS = {
+    "a-tile": ("mr-in-mc", "MR"),
+    "b-tile": ("nr-in-nc", "NR"),
 }
 
 # Matches a BLIS test-driver result row, e.g.
@@ -135,6 +150,16 @@ def parse_mr_nr(specs):
             if pair not in pairs:
                 pairs.append(pair)
     return pairs
+
+
+def tile_to_multiplier(panel_bytes, esize, unit, kc):
+    """BLIS_MR_IN_MC/NR_IN_NC that makes the panel `panel_bytes` bytes wide.
+
+    A panel is `unit * multiplier` rows of `kc` elements, one element being
+    `esize` bytes; MC = MR * multiplier, so this is the inverse of that. BLIS
+    requires the multiplier to be at least 1, hence the clamp.
+    """
+    return max(1, round(panel_bytes / (esize * unit * kc)))
 
 
 def binary_contains(path, needles, chunk_size=1 << 20):
@@ -227,6 +252,23 @@ def build_parser():
     p.add_argument("--quiet", action="store_true",
                    help="silence Optuna's per-trial log lines")
 
+    mode = p.add_argument_group(
+        "search strategy",
+        "Both modes need --mr-nr, since MR/NR identify the microkernel and are "
+        "fixed by the ukrgen configuration rather than by BLIS itself.",
+    )
+    mode.add_argument("--tile", action="store_true",
+                      help="search the A/B panel sizes in bytes and derive "
+                           "BLIS_MR_IN_MC_<S|D>/BLIS_NR_IN_NC_<S|D> from them "
+                           "(MC*KC and NC*KC are the cache invariants, so the "
+                           "optimum no longer moves with MR/NR). "
+                           "--mr-in-mc-*/--nr-in-nc-* are unused in this mode.")
+    mode.add_argument("--per-kernel", action="store_true",
+                      help="run one study per --mr-nr pair, splitting --n-trials "
+                           "between them, and report every pair's own best "
+                           "configuration. Prevents TPE from concentrating the "
+                           "whole budget on the microkernel that looked good early.")
+
     micro = p.add_argument_group(
         "microkernel search space",
         "The (MR, NR) register blocksize pair selects the gemm microkernel, and "
@@ -253,6 +295,21 @@ def build_parser():
                             metavar="N",
                             help=f"drop decompositions with BLIS_{loop}_NT > N "
                                  f"(0 = keep every {loop}_NT)")
+
+    tiles = p.add_argument_group(
+        "tile size search space (--tile)",
+        "Panel sizes in bytes: the A panel is MC*KC*<element size>, the B panel "
+        "NC*KC*<element size>. MC/NC and the BLIS_MR_IN_MC_/BLIS_NR_IN_NC_ "
+        "multipliers are derived from them per trial.",
+    )
+    for stem, (dmin, dmax, dstep) in TILE_PARAMS.items():
+        label = f"the {stem[0].upper()} panel size in bytes"
+        tiles.add_argument(f"--{stem}-min", type=int, default=dmin,
+                           help=f"smallest {label}")
+        tiles.add_argument(f"--{stem}-max", type=int, default=dmax,
+                           help=f"largest {label}")
+        tiles.add_argument(f"--{stem}-step", type=int, default=dstep,
+                           help=f"{stem[0].upper()} panel size increment in bytes")
 
     group = p.add_argument_group(
         "block size search space",
@@ -372,7 +429,7 @@ def main(argv=None):
     if args.threads < 1:
         raise SystemExit("--threads must be >= 1")
 
-    dtype_char, suffix = PRECISIONS[args.precision]
+    dtype_char, suffix, esize = PRECISIONS[args.precision]
 
     # ---- search space: microkernel (MR x NR) ------------------------------ #
     # MR and NR are a single choice: the pair identifies the microkernel, so
@@ -380,6 +437,24 @@ def main(argv=None):
     mr_nr_pairs = parse_mr_nr(args.mr_nr)
     mr_nr_env = (f"BLIS_MR_{suffix}", f"BLIS_NR_{suffix}")
     mr_nr_labels = [f"{mr}x{nr}" for mr, nr in mr_nr_pairs]
+
+    # Both search strategies below convert between MR/NR and the blocksizes, so
+    # they need the microkernel to be known rather than left to the build.
+    if args.tile and not mr_nr_pairs:
+        raise SystemExit(
+            "--tile needs the microkernel: a panel size is turned into "
+            "BLIS_MR_IN_MC_<S|D>/BLIS_NR_IN_NC_<S|D> via MR/NR. Pass --mr-nr."
+        )
+    if args.per_kernel and not mr_nr_pairs:
+        raise SystemExit(
+            "--per-kernel stages the search over the microkernels, so pass --mr-nr."
+        )
+    if args.per_kernel and args.n_trials < len(mr_nr_pairs):
+        raise SystemExit(
+            f"--per-kernel splits --n-trials ({args.n_trials}) over "
+            f"{len(mr_nr_pairs)} microkernels, i.e. less than one trial each; "
+            f"raise --n-trials or drop --per-kernel."
+        )
 
     # ---- locate the driver ------------------------------------------------ #
     workdir = (args.blis_build_dir / "test" / "3").resolve()
@@ -460,12 +535,30 @@ def main(argv=None):
 
     block_space = {}
     for stem in BLOCK_PARAMS:
+        if args.tile and stem != "kc":
+            # MC and NC come from the panel sizes in tile mode; their own
+            # multiplier bounds would only fight the derivation.
+            continue
         attr = stem.replace("-", "_")
         low = getattr(args, f"{attr}_min")
         high = getattr(args, f"{attr}_max")
         step = getattr(args, f"{attr}_step")
         low, high = align_range(low, high, step, stem)
         block_space[stem] = (low, high, step)
+
+    tile_space = {}
+    if args.tile:
+        for stem in TILE_PARAMS:
+            attr = stem.replace("-", "_")
+            low = getattr(args, f"{attr}_min")
+            high = getattr(args, f"{attr}_max")
+            step = getattr(args, f"{attr}_step")
+            low, high = align_range(low, high, step, stem)
+            tile_space[stem] = (low, high, step)
+
+    # Largest KC that will be tried: the panel -> multiplier resolution is
+    # esize*unit*KC bytes, so this is where a byte grid is coarsest.
+    kc_high = block_space["kc"][1]
 
     # Max (edge-block) values are searched as a headroom above the default, in
     # the default's step. That keeps each parameter's range fixed across
@@ -474,6 +567,16 @@ def main(argv=None):
     max_space = {}
     for stem in BLOCK_PARAMS:
         headroom = getattr(args, f"{stem.replace('-', '_')}_headroom")
+        if stem not in block_space:
+            # tile mode: the multiplier is derived, so it has no step for the
+            # headroom arithmetic; edge blocks are then not tuned for it.
+            if headroom:
+                raise SystemExit(
+                    f"--{stem}-headroom is not available with --tile, where "
+                    f"BLIS_{BLOCK_PARAMS[stem][0]}_{suffix} is derived from the "
+                    f"panel size; drop it or leave --tile off."
+                )
+            continue
         step = block_space[stem][2]
         if headroom < 0:
             raise SystemExit(f"--{stem}-headroom must be >= 0")
@@ -512,29 +615,55 @@ def main(argv=None):
                           verbose=args.verbose, aggregate=args.aggregate)
 
     # ---- objective --------------------------------------------------------- #
-    def objective(trial):
-        # The microkernel is chosen first: (MR, NR) is one categorical so the
-        # two variables move together and a pair without a kernel is impossible.
+    def build_config(trial, fixed_pair=None):
+        """Suggest one trial's parameters; return its {BLIS variable: value}.
+
+        `fixed_pair` pins the microkernel, which is what --per-kernel does: the
+        regime stops being a search dimension and becomes the study itself.
+        """
+        # The microkernel comes first: (MR, NR) is one categorical so the two
+        # variables move together and a pair without a kernel is impossible.
         config = {}
-        if mr_nr_pairs:
+        if fixed_pair is not None:
+            config[mr_nr_env[0]], config[mr_nr_env[1]] = fixed_pair
+        elif mr_nr_pairs:
             pair = trial.suggest_categorical("mr_nr", mr_nr_labels)
             config[mr_nr_env[0]], config[mr_nr_env[1]] = map(int, pair.split("x"))
 
         thread_str = trial.suggest_categorical("thread_config", thread_choices)
-        values = dict(zip(THREAD_LOOPS, map(int, thread_str.split("_"))))
+        ways = dict(zip(THREAD_LOOPS, map(int, thread_str.split("_"))))
+        config.update({f"BLIS_{loop}_NT": ways[loop] for loop in THREAD_LOOPS})
 
-        config.update({f"BLIS_{loop}_NT": values[loop] for loop in THREAD_LOOPS})
         for stem, (low, high, step) in block_space.items():
             env_name = block_env_names[stem]
             config[env_name] = trial.suggest_int(env_name, low, high, step=step)
+
+        # --tile: the panel size is the search dimension, MC/NC follow from it
+        # (MC = MR * MR_IN_MC and the A panel is MC*KC*esize bytes, so the
+        # multiplier is just the panel measured in MR-sized rows).
+        if tile_space:
+            mr = config[mr_nr_env[0]]
+            nr = config[mr_nr_env[1]]
+            kc = config[block_env_names["kc"]]
+            for stem, (low, high, step) in tile_space.items():
+                target_stem, unit_name = TILE_TARGETS[stem]
+                unit = mr if unit_name == "MR" else nr
+                panel = trial.suggest_int(stem.replace("-", "_"), low, high, step=step)
+                config[block_env_names[target_stem]] = tile_to_multiplier(
+                    panel, esize, unit, kc
+                )
 
         for stem, (low, high, step) in max_space.items():
             headroom = trial.suggest_int(f"{stem}-headroom", low, high, step=step)
             config[max_env_names[stem]] = config[block_env_names[stem]] + headroom
 
-        # The max values are derived rather than Optuna parameters, so keep the
-        # exact environment of every trial for the report.
+        # The max values (and, with --tile, MC/NC) are derived rather than
+        # Optuna parameters, so keep the exact environment of every trial.
         trial.set_user_attr("config", config)
+        return config
+
+    def run_trial(trial, fixed_pair=None):
+        config = build_config(trial, fixed_pair)
 
         if args.verbose:
             print(f"\n[trial {trial.number}] config: "
@@ -560,10 +689,38 @@ def main(argv=None):
               + " ".join(mr_nr_labels))
     else:
         print(f"microkernel : build default (BLIS_MR_{suffix}/BLIS_NR_{suffix} not set)")
+    if args.tile:
+        print("mode        : tile panels, MC/NC derived per trial "
+              "(--mr-in-mc-*/--nr-in-nc-* unused)")
+    if args.per_kernel:
+        print(f"mode        : one study per microkernel, {len(mr_nr_pairs)} studies "
+              f"over {args.n_trials} trials")
     for stem, (low, high, step) in block_space.items():
         print(f"{block_env_names[stem]:<20}: {low}..{high} step {step}")
     for stem, (low, high, step) in max_space.items():
         print(f"{max_env_names[stem]:<20}: {block_env_names[stem]} + {low}..{high} step {step}")
+    for stem, (low, high, step) in tile_space.items():
+        target = block_env_names[TILE_TARGETS[stem][0]]
+        print(f"{stem:<20}: {low}..{high} step {step} bytes -> {target}")
+        # A panel only moves in whole multipliers, i.e. in quanta of
+        # esize*unit*KC bytes, so at a large KC a byte grid collapses onto a
+        # handful of multipliers. Say so instead of letting it look like a
+        # fine-grained search.
+        unit_name = TILE_TARGETS[stem][1]
+        spans = []
+        for mr, nr in mr_nr_pairs:
+            unit = mr if unit_name == "MR" else nr
+            spans.append(f"{mr}x{nr}:{tile_to_multiplier(low, esize, unit, kc_high)}"
+                         f"..{tile_to_multiplier(high, esize, unit, kc_high)}")
+        narrow = any(
+            tile_to_multiplier(high, esize,
+                               mr if unit_name == "MR" else nr, kc_high)
+            - tile_to_multiplier(low, esize,
+                                 mr if unit_name == "MR" else nr, kc_high) < 3
+            for mr, nr in mr_nr_pairs
+        )
+        print(f"{'':<20}  {target} range at KC={kc_high}: " + " ".join(spans)
+              + ("   [narrow: raise --" + stem + "-max]" if narrow else ""))
     print(f"score       : {args.aggregate} GFLOPs over the problem-size sweep")
     if max_space and args.aggregate == "max":
         print("note        : max block sizes only change edge blocks, which '--aggregate max' "
@@ -574,17 +731,56 @@ def main(argv=None):
         print(f"decomps     : " + " ".join(thread_choices))
     print()
 
-    sampler = optuna.samplers.TPESampler(seed=args.seed) if args.seed is not None else None
-    study = optuna.create_study(direction="maximize", sampler=sampler)
-    study.optimize(objective, n_trials=args.n_trials)
+    studies = []
+    if args.per_kernel:
+        # Split the budget as evenly as possible; the first kernels take the
+        # remainder. Each study owns one microkernel, so block sizes never have
+        # to compete across regimes and every kernel gets mapped.
+        shares = [args.n_trials // len(mr_nr_pairs)] * len(mr_nr_pairs)
+        for i in range(args.n_trials % len(mr_nr_pairs)):
+            shares[i] += 1
+        for i, (pair, trials) in enumerate(zip(mr_nr_pairs, shares)):
+            sampler = (None if args.seed is None
+                       else optuna.samplers.TPESampler(seed=args.seed + i))
+            study = optuna.create_study(direction="maximize", sampler=sampler)
+            study.optimize(lambda trial, pair=pair: run_trial(trial, pair),
+                           n_trials=trials)
+            studies.append((pair, study))
+        study = max((s for _, s in studies), key=lambda s: s.best_value)
+    else:
+        sampler = (None if args.seed is None
+                   else optuna.samplers.TPESampler(seed=args.seed))
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(run_trial, n_trials=args.n_trials)
 
     # ---- report ------------------------------------------------------------ #
     # Export the environment the best trial actually ran with: thread ways,
     # block sizes and any derived max values (default + headroom).
     exports = [f"{k}={v}" for k, v in study.best_trial.user_attrs["config"].items()]
 
+    if studies:
+        # Per-kernel results are the point of --per-kernel: the winning study
+        # alone would hide what the other microkernels can do.
+        print("\nPER-MICROKERNEL RESULTS")
+        print(f"  {'MRxNR':<8}{'GFLOPs':>9}{'trials':>8}  {'threads':<10}blocksizes")
+        for pair, sub in studies:
+            cfg = sub.best_trial.user_attrs["config"]
+            ways = "_".join(str(cfg[f"BLIS_{loop}_NT"]) for loop in THREAD_LOOPS)
+            blocks = " ".join(f"{k.replace('BLIS_', '')}={v}"
+                              for k, v in sorted(cfg.items()) if "_NT" not in k)
+            print(f"  {pair[0]:>2}x{pair[1]:<2} {sub.best_value:9.2f}"
+                  f"{len(sub.trials):>8}  {ways:<10}{blocks}")
+        winner = study.best_trial.user_attrs["config"]
+        print(f"  winner: {winner[mr_nr_env[0]]}x{winner[mr_nr_env[1]]} "
+              f"at {study.best_value:.2f} GFLOPs")
+
     print("\n" + "=" * 50)
-    print(f"BEST GFLOPs: {study.best_value:.2f}  (trial {study.best_trial.number})")
+    winner_note = ""
+    if studies:
+        won = study.best_trial.user_attrs["config"]
+        winner_note = f", {won[mr_nr_env[0]]}x{won[mr_nr_env[1]]}"
+    print(f"BEST GFLOPs: {study.best_value:.2f}  "
+          f"(trial {study.best_trial.number}{winner_note})")
     print("BEST CONFIGURATION:")
     for line in exports:
         print(f"  {line}")
